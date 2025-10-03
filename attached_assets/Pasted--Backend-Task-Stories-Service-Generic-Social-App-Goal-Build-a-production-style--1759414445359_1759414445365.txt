@@ -1,0 +1,211 @@
+# **Backend Task : “Stories Service” (Generic Social App)**
+
+**Goal**
+
+Build a production-style backend for ephemeral Stories: short text + optional media, visible to friends or public, expiring after 24h.
+
+Focus on: auth, DB design, presigned uploads, permissions, real-time events, background jobs, caching, rate-limits, search/logging, testing, and containerized run.
+
+ **Core Entities**
+
+- User: { id, email, password_hash, created_at }
+- Story: { id, author_id, media_url?, text?, visibility, created_at, expires_at, deleted_at? }
+- StoryAudience (for friends-only): { story_id, user_id }
+- StoryView: { story_id, viewer_id, viewed_at }
+- Reaction: { story_id, user_id, emoji, created_at }
+- Follow: { follower_id, followee_id, created_at } (for “friends/following” graph)
+
+Visibility enum: public | friends | private
+
+**Functional Requirements**
+
+**1) Auth (JWT)**
+
+- Email sign-up/login, hashed passwords (bcrypt/argon2).
+- JWT required for all non-auth routes.
+- RBAC/ownership checks enforced server-side.
+
+**2) Media Uploads (Object Storage)**
+
+- Generate presigned upload URLs (S3 or local MinIO).
+- Accept content-type whitelist (image/, video/) + max size (config).
+- Store only the object key/URL in DB; API never proxies bytes.
+
+**3) Stories API (REST)**
+
+Implement JSON endpoints (cursor/limit pagination where applicable):
+
+- POST /stories
+    - body: { text?, media_key?, visibility, audience_user_ids?[] }
+    - server sets expires_at = created_at + 24h (configurable)
+    - if friends: visibility determined by Follow graph
+    - if private: only author can view
+
+- GET /stories/{id}
+    - permission rules based on visibility & graph
+
+- GET /feed
+    - returns active stories the caller can see (friends + public), newest first
+
+- POST /stories/{id}/view
+    - idempotent; records view (insert once per user)
+
+- POST /stories/{id}/reactions
+    - body: { emoji } (choose from 👍 ❤️ 😂 😮 😢 🔥)
+
+- GET /me/stats
+    - returns counts: posted, views, unique viewers, reaction breakdown (last 7d)
+
+**4) Ephemerality Worker**
+
+- Separate process scans every minute:
+    - soft-delete stories where expires_at < now() (set deleted_at)
+    - emit structured logs with counts & durations
+
+**5) Real-time Events**
+
+- WebSocket (or SSE) channel:
+    - story.viewed → { story_id, viewer_id, viewed_at } to the author
+    - story.reacted → { story_id, user_id, emoji } to the author
+
+- Authenticate the socket with the same JWT.
+
+**6) Social Graph**
+
+- Minimal follow/unfollow endpoints:
+    - POST /follow/{user_id}
+    - DELETE /follow/{user_id}
+
+- friends visibility = stories from accounts the caller follows (and optionally mutuals if you prefer; document your choice).
+
+ **Data Model (PostgreSQL)**
+
+```sql
+users(id uuid pk, email text unique, password_hash text, created_at timestamptz default now());
+
+follows(follower_id uuid, followee_id uuid, created_at timestamptz default now(),
+        primary key (follower_id, followee_id));
+
+stories(id uuid pk, author_id uuid references users(id),
+       text text, media_key text, visibility text check (visibility in ('public','friends','private')),
+       created_at timestamptz default now(), expires_at timestamptz, deleted_at timestamptz);
+
+story_audience(story_id uuid references stories(id), user_id uuid references users(id),
+               primary key (story_id, user_id)); -- only if you choose per-story allowlist
+
+story_views(story_id uuid references stories(id), viewer_id uuid references users(id),
+            viewed_at timestamptz, primary key (story_id, viewer_id));
+
+reactions(id uuid pk, story_id uuid references stories(id),
+          user_id uuid references users(id), emoji text, created_at timestamptz default now());
+```
+
+Indexes
+
+- stories(author_id, created_at desc), stories(expires_at), partial index where deleted_at is null
+- story_views(story_id), reactions(story_id), follows(follower_id)
+
+Transactions
+
+- Creating a story with friends + initial explicit audience (if you choose to support it) must be atomic:
+    - insert story → bulk insert audience → commit.
+
+**Platform & Guardrails**
+
+- Input validation & 4xx/5xx discipline.
+- Rate limiting (Redis token bucket):
+    - POST /stories: 20/min per user
+    - POST /reactions: 60/min per user
+- Idempotency: Support Idempotency-Key on POST /stories.
+- CORS configured for localhost client.
+- Config via env (12-factor): DB URL, JWT secret, storage creds, limits.
+
+ **Performance & Caching**
+
+- Use Redis to cache:
+    - current user’s followee IDs
+    - hot feed page for 30–60s
+- N+1 avoidance in feed (preload author, counters).
+
+ **Observability**
+
+- Structured logs (JSON): auth, story_created, story_viewed, story_expired, reaction_added.
+- Metrics (Prometheus):
+    - http_requests_total{route,code}
+    - stories_created_total, story_views_total, reactions_total
+    - worker: stories_expired_total, worker_latency_seconds
+- Health: /healthz (DB/Redis/storage checks).
+
+ **Optional Search (Stretch)**
+
+- GET /search?q=… over stories.text
+    - Option A: Postgres FTS with GIN index.
+    - Option B: Elasticsearch + Kibana dashboard screenshot.
+
+ **Testing**
+
+- Unit tests for handlers (mocks/fakes).
+- Integration tests with testcontainers (Postgres, Redis, MinIO).
+- One small load test (k6/autocannon) hammering create + view.
+
+**Delivery & Run**
+
+- Language: Go preferred (Python FastAPI acceptable).
+- Containers: api, worker, postgres, redis, minio (+ elasticsearch if you do search).
+- docker-compose one-command up; Makefile:
+    - make dev, make test, make lint, make seed
+- API docs: OpenAPI (Swagger UI) or Postman collection.
+
+**Deployment & Cloud Infra Requirements**
+
+1. Dockerize Everything
+    - api, worker, postgres, redis, minio (and elasticsearch if chosen).
+    - Must build and run via docker-compose up.
+2. Cloud Deployment (choose one)
+    - Option A (Easiest): Deploy api + postgres + redis + minio to Heroku / Render / Railway / Fly.io (with free tiers).
+    - Option B (Intermediate): Deploy to AWS ECS or GCP Cloud Run with managed Postgres (RDS/CloudSQL).
+    - Option C (Advanced): Deploy to a Kubernetes cluster (EKS/GKE/DigitalOcean).
+        - Must include manifests for: Deployment, Service, Ingress, Secrets.
+        - Show autoscaling (HPA).
+3. CI/CD
+    - GitHub Actions pipeline with:
+        - make lint + make test
+        - build Docker image
+        - push to registry (GHCR/DockerHub)
+        - auto-deploy to chosen infra
+4. Secrets Management
+    - Use environment variables (12-factor).
+    - Don’t commit creds.
+    - Example: .env.example with placeholders.
+5. Monitoring & Observability
+    - Expose Prometheus metrics at /metrics.
+    - Add a simple Grafana dashboard (stretch goal).
+    - Or at least deploy to cloud and show logs via provider (Heroku logs, CloudWatch, etc.).
+6. Load Testing (Infra)
+    - Run k6/ab/autocannon against /feed endpoint in cloud.
+    - Record latency + throughput (document results).
+
+**README (must include)**
+
+- Architecture diagram & component bullets.
+- Setup + .env sample + one-command run.
+- Walkthrough:
+    1. Sign up & login → JWT
+    2. Get presigned URL → upload media
+    3. Create a story (public/friends)
+    4. Follow a test user, hit /feed
+    5. View + react → observe real-time events
+    6. Run worker → see expirations in logs
+    7. Open /metrics and (if done) Kibana dashboard
+
+**Acceptance Checklist**
+
+- Auth works; permissions enforced for public/friends/private
+- Presigned upload flow works; media never proxied
+- Feed returns only active permitted stories
+- Views are idempotent; reactions recorded
+- Real-time events delivered to authors on view/reaction
+- Worker expires stories and logs actions
+- Redis cache + rate limits in place
+- Metrics exposed; healthz implemented
+- Tests pass locally; repo reproducible with one command
